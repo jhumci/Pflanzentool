@@ -134,27 +134,86 @@ with tab1:
             st.table(res_data)
             st.metric("Gesamtkosten pro 10L", f"{total_cost:.2f} €")
 
-            # Vergleichschart (grün = Ziel, grau = Mischung)
-            st.subheader("Profil-Abgleich (Ziel vs. Erreicht)")
+            # Vergleichschart: Ziel (grün) und Mischungs-Breakdown pro Dünger (gestapelt)
+            st.subheader("Profil-Abgleich (Ziel vs. Mischung nach Dünger)")
+
+            nutrient_labels = ['N', 'P', 'K', 'Ca', 'Mg', 'S']
+            # Gesamtwerte DataFrame (Ziel vs Gesamt-Mischung)
             comparison_df = pd.DataFrame({
-                "Nährstoff": ['N', 'P', 'K', 'Ca', 'Mg', 'S'],
-                "Bedarf (Netto)": netto_req,
-                "Erreicht (Dünger)": achieved
+                "Nährstoff": nutrient_labels,
+                "Ziel": netto_req,
+                "Mischung": achieved
             })
 
-            # In langes Format für gruppierte Balken umwandeln
-            melt = comparison_df.melt(id_vars='Nährstoff', var_name='type', value_name='value')
-            melt['type'] = melt['type'].map({'Bedarf (Netto)': 'Ziel', 'Erreicht (Dünger)': 'Mischung'})
+            # Beiträge pro Dünger berechnen (mg/L): composition (mg/ml) * amount (ml/L)
+            nutrient_keys = ['n', 'p', 'k', 'ca', 'mg', 's']
+            matrix = []
+            for f in all_ferts:
+                matrix.append([f['composition'].get(k, 0) for k in nutrient_keys])
+            matrix = np.array(matrix).T  # shape: (nutrients, ferts)
 
-            chart = alt.Chart(melt).mark_bar().encode(
+            amounts_per_fert = np.array(amounts)  # ml/L per Dünger
+            contrib = matrix * amounts_per_fert  # broadcasting -> (nutrients, ferts)
+
+            # Melt contributions into long format
+            rows = []
+            fert_names = [f['name'] for f in all_ferts]
+            for i, nutr in enumerate(nutrient_labels):
+                for j, fname in enumerate(fert_names):
+                    val = float(contrib[i, j])
+                    if val > 1e-9:
+                        rows.append({"Nährstoff": nutr, "Dünger": fname, "value": val, "group": "Mischung"})
+
+            mix_df = pd.DataFrame(rows)
+            # Target rows
+            targ_rows = [{"Nährstoff": nutrient_labels[i], "Dünger": "Ziel", "value": float(netto_req[i]), "group": "Ziel"} for i in range(len(nutrient_labels))]
+            targ_df = pd.DataFrame(targ_rows)
+
+            # Stacked mixture chart (Beiträge nach Dünger)
+            mix_chart = alt.Chart(mix_df).mark_bar().encode(
                 x=alt.X('Nährstoff:N', title='Nährstoff'),
-                y=alt.Y('value:Q', title='mg/L'),
-                color=alt.Color('type:N', scale=alt.Scale(domain=['Ziel', 'Mischung'], range=['#2ca02c', '#b0b0b0']), legend=alt.Legend(title='')),
-                xOffset='type:N',
-                tooltip=['Nährstoff', 'type', alt.Tooltip('value:Q', format='.2f')]
-            ).properties(height=320)
+                y=alt.Y('value:Q', title='mg/L', stack='zero'),
+                color=alt.Color('Dünger:N', legend=alt.Legend(title='Dünger')),
+                xOffset=alt.XOffset('group:N'),
+                tooltip=['Nährstoff', 'Dünger', alt.Tooltip('value:Q', format='.2f')]
+            )
 
+            # Zielbalken (grün)
+            target_chart = alt.Chart(targ_df).mark_bar(color='#2ca02c').encode(
+                x=alt.X('Nährstoff:N'),
+                y=alt.Y('value:Q'),
+                xOffset=alt.XOffset('group:N'),
+                tooltip=['Nährstoff', alt.Tooltip('value:Q', format='.2f')]
+            )
+
+            chart = alt.layer(mix_chart, target_chart).properties(height=360)
             st.altair_chart(chart, use_container_width=True)
+
+            # Kreisdiagramm: Anteil der Dünger an der Beitragssumme (gesamt mg/L)
+            fert_totals = contrib.sum(axis=0) if contrib.size else np.array([])
+            pie_rows = []
+            for j, fname in enumerate(fert_names):
+                val = float(fert_totals[j]) if j < len(fert_totals) else 0.0
+                if val > 1e-9:
+                    pie_rows.append({"Dünger": fname, "value": val})
+
+            pie_df = pd.DataFrame(pie_rows)
+            if pie_df.empty:
+                st.info("Keine Beiträge von Düngern zur Mischung vorhanden.")
+            else:
+                pie_df['pct'] = pie_df['value'] / pie_df['value'].sum() * 100
+                pie_chart = alt.Chart(pie_df).mark_arc(innerRadius=40).encode(
+                    theta=alt.Theta('value:Q', title='mg/L'),
+                    color=alt.Color('Dünger:N', legend=alt.Legend(title='Dünger')),
+                    tooltip=[alt.Tooltip('Dünger:N'), alt.Tooltip('value:Q', format='.2f'), alt.Tooltip('pct:Q', format='.1f')]
+                ).properties(height=300)
+
+                st.subheader('Anteile der Dünger an der Mischung (gesamt mg/L)')
+                st.altair_chart(pie_chart, use_container_width=True)
+                # Tabelle mit Prozenten
+                pct_table = pie_df[['Dünger', 'pct']].copy()
+                pct_table['pct'] = pct_table['pct'].map(lambda x: f"{x:.1f} %")
+                st.table(pct_table)
 
 # --- TAB 2: DÜNGEMITTEL ---
 with tab2:
