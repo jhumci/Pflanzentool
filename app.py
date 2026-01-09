@@ -4,6 +4,7 @@ import numpy as np
 import os
 import json
 import altair as alt
+from nutrient_profile import NutrientProfile
 from tinydb import TinyDB, Query
 from scipy.optimize import minimize
 
@@ -134,83 +135,27 @@ with tab1:
             st.table(res_data)
             st.metric("Gesamtkosten pro 10L", f"{total_cost:.2f} €")
 
-            # Vergleichschart: Ziel (grün) und Mischungs-Breakdown pro Dünger (gestapelt)
+            # Vergleichs- und Kreisdiagramme via `NutrientProfile`
             st.subheader("Profil-Abgleich (Ziel vs. Mischung nach Dünger)")
 
-            nutrient_labels = ['N', 'P', 'K', 'Ca', 'Mg', 'S']
-            # Gesamtwerte DataFrame (Ziel vs Gesamt-Mischung)
-            comparison_df = pd.DataFrame({
-                "Nährstoff": nutrient_labels,
-                "Ziel": netto_req,
-                "Mischung": achieved
-            })
-
-            # Beiträge pro Dünger berechnen (mg/L): composition (mg/ml) * amount (ml/L)
             nutrient_keys = ['n', 'p', 'k', 'ca', 'mg', 's']
             matrix = []
             for f in all_ferts:
                 matrix.append([f['composition'].get(k, 0) for k in nutrient_keys])
-            matrix = np.array(matrix).T  # shape: (nutrients, ferts)
+            matrix = np.array(matrix).T
 
-            amounts_per_fert = np.array(amounts)  # ml/L per Dünger
-            contrib = matrix * amounts_per_fert  # broadcasting -> (nutrients, ferts)
-
-            # Melt contributions into long format
-            rows = []
             fert_names = [f['name'] for f in all_ferts]
-            for i, nutr in enumerate(nutrient_labels):
-                for j, fname in enumerate(fert_names):
-                    val = float(contrib[i, j])
-                    if val > 1e-9:
-                        rows.append({"Nährstoff": nutr, "Dünger": fname, "value": val, "group": "Mischung"})
 
-            mix_df = pd.DataFrame(rows)
-            # Target rows
-            targ_rows = [{"Nährstoff": nutrient_labels[i], "Dünger": "Ziel", "value": float(netto_req[i]), "group": "Ziel"} for i in range(len(nutrient_labels))]
-            targ_df = pd.DataFrame(targ_rows)
-
-            # Stacked mixture chart (Beiträge nach Dünger)
-            mix_chart = alt.Chart(mix_df).mark_bar().encode(
-                x=alt.X('Nährstoff:N', title='Nährstoff'),
-                y=alt.Y('value:Q', title='mg/L', stack='zero'),
-                color=alt.Color('Dünger:N', legend=alt.Legend(title='Dünger')),
-                xOffset=alt.XOffset('group:N'),
-                tooltip=['Nährstoff', 'Dünger', alt.Tooltip('value:Q', format='.2f')]
-            )
-
-            # Zielbalken (grün)
-            target_chart = alt.Chart(targ_df).mark_bar(color='#2ca02c').encode(
-                x=alt.X('Nährstoff:N'),
-                y=alt.Y('value:Q'),
-                xOffset=alt.XOffset('group:N'),
-                tooltip=['Nährstoff', alt.Tooltip('value:Q', format='.2f')]
-            )
-
-            chart = alt.layer(mix_chart, target_chart).properties(height=360)
+            chart = NutrientProfile.layered_mixture_vs_target(netto_req, matrix, amounts, fert_names)
             st.altair_chart(chart, use_container_width=True)
 
-            # Kreisdiagramm: Anteil der Dünger an der Beitragssumme (gesamt mg/L)
-            fert_totals = contrib.sum(axis=0) if contrib.size else np.array([])
-            pie_rows = []
-            for j, fname in enumerate(fert_names):
-                val = float(fert_totals[j]) if j < len(fert_totals) else 0.0
-                if val > 1e-9:
-                    pie_rows.append({"Dünger": fname, "value": val})
-
-            pie_df = pd.DataFrame(pie_rows)
+            pie_df = NutrientProfile.pie_df_from_matrix(matrix, amounts, fert_names)
             if pie_df.empty:
                 st.info("Keine Beiträge von Düngern zur Mischung vorhanden.")
             else:
-                pie_df['pct'] = pie_df['value'] / pie_df['value'].sum() * 100
-                pie_chart = alt.Chart(pie_df).mark_arc(innerRadius=40).encode(
-                    theta=alt.Theta('value:Q', title='mg/L'),
-                    color=alt.Color('Dünger:N', legend=alt.Legend(title='Dünger')),
-                    tooltip=[alt.Tooltip('Dünger:N'), alt.Tooltip('value:Q', format='.2f'), alt.Tooltip('pct:Q', format='.1f')]
-                ).properties(height=300)
-
+                pie_chart = NutrientProfile.pie_chart_from_df(pie_df)
                 st.subheader('Anteile der Dünger an der Mischung (gesamt mg/L)')
                 st.altair_chart(pie_chart, use_container_width=True)
-                # Tabelle mit Prozenten
                 pct_table = pie_df[['Dünger', 'pct']].copy()
                 pct_table['pct'] = pct_table['pct'].map(lambda x: f"{x:.1f} %")
                 st.table(pct_table)
@@ -264,18 +209,36 @@ with tab2:
         if st.session_state.get(f"edit_fert_{f['name']}", False):
             with st.expander(f"Bearbeite {f['name']}", expanded=True):
                 with st.form(f"fert_edit_form_{f['name']}"):
+                    # Reverse-convert stored elemental mg/ml to approximate oxide/percent inputs
+                    comp = f.get('composition', {})
+                    # reverse: percent_est = elem_mg_per_ml / 10 / conv
+                    n_pct = comp.get('n', 0.0) / 10.0
+                    p2o5_pct = comp.get('p', 0.0) / (10.0 * CONV['P2O5_P']) if CONV['P2O5_P'] else 0.0
+                    k2o_pct = comp.get('k', 0.0) / (10.0 * CONV['K2O_K']) if CONV['K2O_K'] else 0.0
+                    cao_pct = comp.get('ca', 0.0) / (10.0 * CONV['CaO_Ca']) if CONV['CaO_Ca'] else 0.0
+                    mgo_pct = comp.get('mg', 0.0) / (10.0 * CONV['MgO_Mg']) if CONV['MgO_Mg'] else 0.0
+                    so3_pct = comp.get('s', 0.0) / (10.0 * CONV['SO3_S']) if CONV['SO3_S'] else 0.0
+
                     ename = st.text_input("Name des Düngers", value=f['name'], key=f"ename_{f['name']}")
                     eprice = st.number_input("Preis pro ml (€)", format="%.4f", value=f.get('price_per_ml', 0.0), key=f"eprice_{f['name']}")
-                    st.write("Inhaltsstoffe (elementar, mg/ml)")
+                    st.write("Inhaltsstoffe (in % oder mg/ml eingeben)")
                     c1, c2, c3 = st.columns(3)
-                    en = c1.number_input("N (mg/ml)", value=f.get('composition', {}).get('n', 0.0), key=f"en_{f['name']}")
-                    ep = c2.number_input("P (mg/ml)", value=f.get('composition', {}).get('p', 0.0), key=f"ep_{f['name']}")
-                    ek = c3.number_input("K (mg/ml)", value=f.get('composition', {}).get('k', 0.0), key=f"ek_{f['name']}")
-                    ca = c1.number_input("Ca (mg/ml)", value=f.get('composition', {}).get('ca', 0.0), key=f"eca_{f['name']}")
-                    mg = c2.number_input("Mg (mg/ml)", value=f.get('composition', {}).get('mg', 0.0), key=f"emg_{f['name']}")
-                    s = c3.number_input("S (mg/ml)", value=f.get('composition', {}).get('s', 0.0), key=f"es_{f['name']}")
+                    en = c1.number_input("N (Gesamtstickstoff, %)", value=round(n_pct, 3), key=f"en_{f['name']}")
+                    ep2 = c2.number_input("P2O5 (%,)", value=round(p2o5_pct, 3), key=f"ep2_{f['name']}")
+                    ek2 = c3.number_input("K2O (%,)", value=round(k2o_pct, 3), key=f"ek2_{f['name']}")
+                    ecao = c1.number_input("CaO (% )", value=round(cao_pct, 3), key=f"ecao_{f['name']}")
+                    emgo = c2.number_input("MgO (% )", value=round(mgo_pct, 3), key=f"emgo_{f['name']}")
+                    eso3 = c3.number_input("SO3 (% )", value=round(so3_pct, 3), key=f"eso3_{f['name']}")
                     if st.form_submit_button("Speichern", key=f"save_fert_{f['name']}"):
-                        new_comp = {"n": en, "p": ep, "k": ek, "ca": ca, "mg": mg, "s": s}
+                        # Convert back to elemental mg/ml (same convention as creation)
+                        new_comp = {
+                            "n": en * 10,
+                            "p": ep2 * 10 * CONV["P2O5_P"],
+                            "k": ek2 * 10 * CONV["K2O_K"],
+                            "ca": ecao * 10 * CONV["CaO_Ca"],
+                            "mg": emgo * 10 * CONV["MgO_Mg"],
+                            "s": eso3 * 10 * CONV["SO3_S"]
+                        }
                         ferts_table.update({'name': ename, 'price_per_ml': eprice, 'composition': new_comp}, Query().name == f['name'])
                         st.success("Dünger aktualisiert")
                         st.session_state.pop(f"edit_fert_{f['name']}", None)
@@ -315,7 +278,13 @@ with tab3:
     # Liste der Pflanzen (mit Editiermöglichkeit)
     for p in plants_table.all():
         st.write(f"### {p['name']}")
-        st.json(p['phases'])
+        # Zeige Phase/Nährstoffprofile als Tabelle
+        phases = p.get('phases', {})
+        if phases:
+            df_phases = pd.DataFrame(phases).T
+            st.table(df_phases)
+        else:
+            st.write("(keine Phasen)")
         colp1, colp2 = st.columns([4, 1])
         if colp2.button(f"{p['name']} löschen", key=f"delplant_{p['name']}"):
             plants_table.remove(Query().name == p['name'])
