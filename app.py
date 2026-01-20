@@ -92,6 +92,41 @@ def run_optimization(target_profile, available_ferts, water_profile):
     
     return res.x, target_netto, (matrix @ res.x)
 
+def run_optimization_with_limit(target_profile, available_ferts, water_profile, max_fertilizers):
+    """Berechnet optimale Mischung mit Limit auf maximale Anzahl von Düngern."""
+    # Erste Optimierung ohne Limit
+    amounts, netto_req, achieved = run_optimization(target_profile, available_ferts, water_profile)
+    
+    # Wenn wir bereits unter dem Limit sind, zurückgeben
+    num_used = np.sum(amounts > 0.01)
+    if num_used <= max_fertilizers:
+        return amounts, netto_req, achieved
+    
+    # Sonst: Nur die top max_fertilizers behalten (nach Beitrag sortiert)
+    # Beitrag = wie viel mg/L dieser Dünger zur Gesamtmischung beiträgt
+    nutrient_keys = ['n', 'p', 'k', 'ca', 'mg', 's']
+    matrix = []
+    for f in available_ferts:
+        matrix.append([f['composition'].get(k, 0) for k in nutrient_keys])
+    matrix = np.array(matrix).T
+    
+    contrib = matrix * amounts  # (nutrients, ferts)
+    total_contrib = np.sum(np.abs(contrib), axis=0)  # Summe pro Dünger
+    
+    # Top N Dünger auswählen
+    top_indices = np.argsort(total_contrib)[-max_fertilizers:]
+    
+    # Re-optimieren mit nur diesen Düngern
+    ferts_subset = [available_ferts[i] for i in top_indices]
+    amounts_subset, netto_req_subset, achieved_subset = run_optimization(target_profile, ferts_subset, water_profile)
+    
+    # In Original-Größe zurück
+    amounts_full = np.zeros(len(available_ferts))
+    for new_idx, orig_idx in enumerate(sorted(top_indices)):
+        amounts_full[orig_idx] = amounts_subset[new_idx]
+    
+    return amounts_full, netto_req_subset, achieved_subset
+
 # --- UI NAVIGATION ---
 st.title("🌿 Hydroponik Nährstoff-Optimizer")
 tab1, tab2, tab3, tab4 = st.tabs(["🧮 Optimierung", "🧪 Düngemittel", "🌱 Pflanzen", "📋 Logs"])
@@ -157,8 +192,18 @@ with tab1:
         
         liters = st.number_input("Menge der Nährlösung (Liter)", min_value=1.0, value=10.0, step=1.0)
         
+        # Optimierungseinstellungen
+        with st.expander("⚙️ Optimierungseinstellungen"):
+            max_ferts = st.number_input(
+                "Maximale Anzahl von Zusätzen (Dünger)",
+                min_value=1,
+                max_value=len(all_ferts),
+                value=len(all_ferts),
+                help="Wie viele verschiedene Dünger maximal verwendet werden sollen"
+            )
+        
         if st.button("🚀 Optimale Mischung berechnen", type="primary", key="calc_mix_btn"):
-            opt_result = run_optimization(target_vals, all_ferts, display_water)
+            opt_result = run_optimization_with_limit(target_vals, all_ferts, display_water, max_ferts)
             st.session_state.calc_results = {
                 'amounts': opt_result[0],
                 'netto_req': opt_result[1],
