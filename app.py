@@ -7,12 +7,14 @@ import altair as alt
 from nutrient_profile import NutrientProfile
 from tinydb import TinyDB, Query
 from scipy.optimize import minimize
+from datetime import datetime
 
 # --- KONFIGURATION & DB ---
 st.set_page_config(page_title="Hydro Optimizer", layout="wide")
 db = TinyDB('db.json')
 plants_table = db.table('plants')
 ferts_table = db.table('fertilizers')
+logs_table = db.table('logs')
 
 # Wenn eine alternative JSON-DB vorhanden ist (z.B. data/db.json),
 # beim Start in die TinyDB-Tabellen importieren (ohne Duplikate).
@@ -65,12 +67,12 @@ if 'ext_water_quality' in globals():
     WATER_QUALITY = ext_water_quality
 
 # --- LOGIK FUNKTIONEN ---
-def run_optimization(target_profile, available_ferts):
+def run_optimization(target_profile, available_ferts, water_profile):
     """Berechnet die optimale Menge ml/L pro Dünger."""
     nutrient_keys = ['n', 'p', 'k', 'ca', 'mg', 's']
     
     # Netto-Bedarf (Ziel - Wasser)
-    target_netto = np.array([max(0, target_profile[k] - WATER_QUALITY[k]) for k in nutrient_keys])
+    target_netto = np.array([max(0, target_profile[k] - water_profile[k]) for k in nutrient_keys])
     
     # Matrix der Dünger-Inhaltsstoffe
     fert_names = [f['name'] for f in available_ferts]
@@ -92,7 +94,7 @@ def run_optimization(target_profile, available_ferts):
 
 # --- UI NAVIGATION ---
 st.title("🌿 Hydroponik Nährstoff-Optimizer")
-tab1, tab2, tab3 = st.tabs(["🧮 Optimierung", "🧪 Düngemittel", "🌱 Pflanzen"])
+tab1, tab2, tab3, tab4 = st.tabs(["🧮 Optimierung", "🧪 Düngemittel", "🌱 Pflanzen", "📋 Logs"])
 
 # --- TAB 1: OPTIMIERUNG ---
 with tab1:
@@ -104,39 +106,114 @@ with tab1:
     if not all_plants or not all_ferts:
         st.warning("Bitte lege zuerst Pflanzen und Düngemittel in den anderen Tabs an!")
     else:
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns([2, 2])
+        
         with col1:
-            p_name = st.selectbox("Pflanze wählen", [p['name'] for p in all_plants])
-            plant = next(p for p in all_plants if p['name'] == p_name)
-            phase = st.selectbox("Wachstumsphase", list(plant['phases'].keys()))
-            target_vals = plant['phases'][phase]
-
-        with col2:
-            st.info(f"**Basis: Leitungswasser Dagersheim**\n(Ca: {WATER_QUALITY['ca']}, Mg: {WATER_QUALITY['mg']} mg/L)")
-            with st.expander("Zielprofil Details (mg/L)"):
-                st.write(target_vals)
-
-        if st.button("🚀 Besten Mix berechnen", type="primary"):
-            amounts, netto_req, achieved = run_optimization(target_vals, all_ferts)
+            st.subheader("Wasserqualität")
+            water_type = st.selectbox(
+                "Wasser wählen",
+                ["Leitungswasser Dagersheim", "Destilliertes Wasser"],
+                key="water_select"
+            )
             
-            st.subheader("Ergebnis: Dosierung für 10 Liter Wasser")
+            if water_type == "Destilliertes Wasser":
+                display_water = {"n": 0, "p": 0, "k": 0, "ca": 0, "mg": 0, "s": 0}
+            else:
+                display_water = WATER_QUALITY
+            
+            st.write("**Zusammensetzung (mg/L):**")
+            water_df = pd.DataFrame({
+                "Element": ["N", "P", "K", "Ca", "Mg", "S"],
+                "Menge (mg/L)": [display_water["n"], display_water["p"], display_water["k"], 
+                                 display_water["ca"], display_water["mg"], display_water["s"]]
+            })
+            st.table(water_df)
+        
+        with col2:
+            st.subheader("Nährstoffziel")
+            target_plant = st.selectbox(
+                "Pflanze wählen",
+                [p['name'] for p in all_plants],
+                key="plant_select"
+            )
+            plant = next(p for p in all_plants if p['name'] == target_plant)
+            
+            target_phase = st.selectbox(
+                "Wachstumsphase",
+                list(plant['phases'].keys()),
+                key="phase_select"
+            )
+            target_vals = plant['phases'][target_phase]
+            
+            st.write("**Zielwerte (mg/L):**")
+            target_df = pd.DataFrame({
+                "Element": ["N", "P", "K", "Ca", "Mg", "S"],
+                "Ziel (mg/L)": [target_vals["n"], target_vals["p"], target_vals["k"],
+                               target_vals["ca"], target_vals["mg"], target_vals["s"]]
+            })
+            st.table(target_df)
+        
+        st.divider()
+        
+        liters = st.number_input("Menge der Nährlösung (Liter)", min_value=1.0, value=10.0, step=1.0)
+        
+        if st.button("🚀 Optimale Mischung berechnen", type="primary", key="calc_mix_btn"):
+            opt_result = run_optimization(target_vals, all_ferts, display_water)
+            st.session_state.calc_results = {
+                'amounts': opt_result[0],
+                'netto_req': opt_result[1],
+                'achieved': opt_result[2],
+                'water_profile': display_water,
+                'plant': target_plant,
+                'phase': target_phase,
+                'water_type': water_type,
+                'liters': liters
+            }
+        
+        # Zeige Ergebnisse, falls vorhanden
+        if 'calc_results' in st.session_state:
+            res = st.session_state.calc_results
+            amounts = res['amounts']
+            netto_req = res['netto_req']
+            achieved = res['achieved']
+            liters = res['liters']
+            target_plant = res['plant']
+            target_phase = res['phase']
+            water_type = res['water_type']
+            
+            st.subheader(f"Ergebnis für {liters} Liter")
+            
+            # Tabelle: Was man mischen muss
             res_data = []
             total_cost = 0
+            total_fert_ml = 0
+            
             for i, fert in enumerate(all_ferts):
                 if amounts[i] > 0.01:
-                    cost = amounts[i] * 10 * fert.get('price_per_ml', 0)
+                    ml_needed = amounts[i] * liters
+                    cost = ml_needed * fert.get('price_per_ml', 0)
                     res_data.append({
-                        "Dünger": fert['name'],
-                        "ml pro 10L": round(amounts[i] * 10, 2),
-                        "Kosten (€/10L)": f"{cost:.2f} €"
+                        "Komponente": fert['name'],
+                        f"Menge pro {liters}L": f"{round(ml_needed, 2)} ml",
+                        "Kosten (€)": f"{cost:.2f} €"
                     })
                     total_cost += cost
+                    total_fert_ml += ml_needed
             
-            st.table(res_data)
-            st.metric("Gesamtkosten pro 10L", f"{total_cost:.2f} €")
-
-            # Vergleichs- und Kreisdiagramme via `NutrientProfile`
-            st.subheader("Profil-Abgleich (Ziel vs. Mischung nach Dünger)")
+            # Wasser als Rest berechnen
+            water_ml = (liters * 1000) - total_fert_ml
+            res_data.append({
+                "Komponente": "Leitungswasser" if water_type == "Leitungswasser Dagersheim" else "Destilliertes Wasser",
+                f"Menge pro {liters}L": f"{round(water_ml, 2)} ml",
+                "Kosten (€)": "0.00 €"
+            })
+            
+            result_df = pd.DataFrame(res_data)
+            st.table(result_df)
+            st.metric("Gesamtkosten", f"{total_cost:.2f} €")
+            
+            st.divider()
+            st.subheader("Profil-Abgleich (Ziel vs. Mischung)")
 
             nutrient_keys = ['n', 'p', 'k', 'ca', 'mg', 's']
             matrix = []
@@ -146,174 +223,207 @@ with tab1:
 
             fert_names = [f['name'] for f in all_ferts]
 
-            chart = NutrientProfile.layered_mixture_vs_target(netto_req, matrix, amounts, fert_names)
+            chart = NutrientProfile.layered_mixture_vs_target(netto_req, matrix, amounts, fert_names, res['water_profile'])
             st.altair_chart(chart, use_container_width=True)
 
-            pie_df = NutrientProfile.pie_df_from_matrix(matrix, amounts, fert_names)
-            if pie_df.empty:
-                st.info("Keine Beiträge von Düngern zur Mischung vorhanden.")
-            else:
-                pie_chart = NutrientProfile.pie_chart_from_df(pie_df)
-                st.subheader('Anteile der Dünger an der Mischung (gesamt mg/L)')
-                st.altair_chart(pie_chart, use_container_width=True)
-                pct_table = pie_df[['Dünger', 'pct']].copy()
-                pct_table['pct'] = pct_table['pct'].map(lambda x: f"{x:.1f} %")
-                st.table(pct_table)
+            st.divider()
+            st.subheader("Volumenanteile der Mischung")
+            
+            col1, col2 = st.columns(2)
+            
+            # Mit Wasser
+            with col1:
+                pie_vol_df_with_water = NutrientProfile.pie_df_volume(amounts, fert_names, liters)
+                if not pie_vol_df_with_water.empty:
+                    pie_vol_chart = NutrientProfile.pie_chart_volume(pie_vol_df_with_water, f"Mit Wasser ({liters}L)")
+                    st.altair_chart(pie_vol_chart, use_container_width=True)
+            
+            # Ohne Wasser
+            with col2:
+                pie_vol_df_no_water = NutrientProfile.pie_df_volume_no_water(amounts, fert_names)
+                if not pie_vol_df_no_water.empty:
+                    pie_vol_chart_no_water = NutrientProfile.pie_chart_volume(pie_vol_df_no_water, "Nur Dünger")
+                    st.altair_chart(pie_vol_chart_no_water, use_container_width=True)
+            
+            st.divider()
+            
+            # Log-Button
+            if st.button("📝 Diese Mischung loggen", type="secondary", key="log_mix_btn"):
+                log_entry = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "plant": target_plant,
+                    "phase": target_phase,
+                    "water_type": water_type,
+                    "liters": liters,
+                    "fertilizers": [
+                        {
+                            "name": fert['name'],
+                            "ml": round(amounts[i] * liters, 2)
+                        }
+                        for i, fert in enumerate(all_ferts)
+                        if amounts[i] > 0.01
+                    ],
+                    "total_cost": round(total_cost, 2)
+                }
+                logs_table.insert(log_entry)
+                st.session_state.log_success = True
+            
+            if st.session_state.get('log_success', False):
+                st.success("✅ Mischung gespeichert in der Datenbank!")
 
 # --- TAB 2: DÜNGEMITTEL ---
 with tab2:
     st.header("Düngemittel-Datenbank")
     
-    with st.expander("➕ Neuen Dünger hinzufügen / Oxid-Rechner"):
-        with st.form("fert_form"):
-            name = st.text_input("Name des Düngers")
-            price = st.number_input("Preis pro ml (€)", format="%.4f", value=0.015)
-            
-            st.write("Inhaltsstoffe (in % oder mg/ml eingeben)")
-            c1, c2, c3 = st.columns(3)
-            n_val = c1.number_input("N (Gesamtstickstoff)")
-            p2o5 = c2.number_input("P2O5 (Phosphorpentoxid)")
-            k2o = c3.number_input("K2O (Kaliumoxid)")
-            cao = c1.number_input("CaO (Calciumoxid)")
-            mgo = c2.number_input("MgO (Magnesiumoxid)")
-            so3 = c3.number_input("SO3 (Schwefeltrioxid)")
-            
-            if st.form_submit_button("Speichern"):
-                # Umrechnung in elementare mg/ml (Annahme: 1% = 10mg/ml bei flüssig)
+    # Build table data from database
+    fert_table_data = []
+    for f in ferts_table.all():
+        comp = f.get('composition', {})
+        # Reverse-convert elemental mg/ml to oxide percentages
+        n_pct = comp.get('n', 0.0) / 10.0
+        p2o5_pct = comp.get('p', 0.0) / (10.0 * CONV['P2O5_P']) if CONV['P2O5_P'] else 0.0
+        k2o_pct = comp.get('k', 0.0) / (10.0 * CONV['K2O_K']) if CONV['K2O_K'] else 0.0
+        cao_pct = comp.get('ca', 0.0) / (10.0 * CONV['CaO_Ca']) if CONV['CaO_Ca'] else 0.0
+        mgo_pct = comp.get('mg', 0.0) / (10.0 * CONV['MgO_Mg']) if CONV['MgO_Mg'] else 0.0
+        so3_pct = comp.get('s', 0.0) / (10.0 * CONV['SO3_S']) if CONV['SO3_S'] else 0.0
+        
+        fert_table_data.append({
+            "Name": f['name'],
+            "Preis €/ml": f.get('price_per_ml', 0.0),
+            "N %": round(n_pct, 3),
+            "P2O5 %": round(p2o5_pct, 3),
+            "K2O %": round(k2o_pct, 3),
+            "CaO %": round(cao_pct, 3),
+            "MgO %": round(mgo_pct, 3),
+            "SO3 %": round(so3_pct, 3)
+        })
+    
+    df_ferts = pd.DataFrame(fert_table_data)
+    
+    st.subheader("Dünger bearbeiten")
+    st.info("Bearbeite die Tabelle direkt. Neue Zeilen werden automatisch hinzugefügt.")
+    
+    edited_ferts = st.data_editor(
+        df_ferts,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="ferts_editor"
+    )
+    
+    # Save changes back to database
+    if st.button("💾 Änderungen speichern", type="primary", key="save_ferts_btn"):
+        # Clear old data
+        ferts_table.truncate()
+        
+        # Rebuild from edited dataframe
+        for _, row in edited_ferts.iterrows():
+            name = row['Name']
+            if name:  # Skip empty rows
+                # Convert oxide percentages back to elemental mg/ml
                 new_fert = {
                     "name": name,
-                    "price_per_ml": price,
+                    "price_per_ml": float(row['Preis €/ml']) if pd.notna(row['Preis €/ml']) else 0.0,
                     "composition": {
-                        "n": n_val * 10,
-                        "p": p2o5 * 10 * CONV["P2O5_P"],
-                        "k": k2o * 10 * CONV["K2O_K"],
-                        "ca": cao * 10 * CONV["CaO_Ca"],
-                        "mg": mgo * 10 * CONV["MgO_Mg"],
-                        "s": so3 * 10 * CONV["SO3_S"]
+                        "n": float(row['N %']) * 10 if pd.notna(row['N %']) else 0.0,
+                        "p": float(row['P2O5 %']) * 10 * CONV["P2O5_P"] if pd.notna(row['P2O5 %']) else 0.0,
+                        "k": float(row['K2O %']) * 10 * CONV["K2O_K"] if pd.notna(row['K2O %']) else 0.0,
+                        "ca": float(row['CaO %']) * 10 * CONV["CaO_Ca"] if pd.notna(row['CaO %']) else 0.0,
+                        "mg": float(row['MgO %']) * 10 * CONV["MgO_Mg"] if pd.notna(row['MgO %']) else 0.0,
+                        "s": float(row['SO3 %']) * 10 * CONV["SO3_S"] if pd.notna(row['SO3 %']) else 0.0
                     }
                 }
                 ferts_table.insert(new_fert)
-                st.success(f"{name} hinzugefügt!")
-                st.rerun()
-
-        # Liste anzeigen (mit Editiermöglichkeit)
-    for f in ferts_table.all():
-        col_f1, col_f2, col_f3 = st.columns([4, 1, 1])
-        col_f1.write(f"**{f['name']}** ({f.get('price_per_ml')} €/ml)")
-        if col_f2.button("Löschen", key=f"del_{f['name']}"):
-            ferts_table.remove(Query().name == f['name'])
-            st.rerun()
-        if col_f3.button("Bearbeiten", key=f"edit_{f['name']}"):
-            st.session_state[f"edit_fert_{f['name']}"] = True
-
-        if st.session_state.get(f"edit_fert_{f['name']}", False):
-            with st.expander(f"Bearbeite {f['name']}", expanded=True):
-                with st.form(f"fert_edit_form_{f['name']}"):
-                    # Reverse-convert stored elemental mg/ml to approximate oxide/percent inputs
-                    comp = f.get('composition', {})
-                    # reverse: percent_est = elem_mg_per_ml / 10 / conv
-                    n_pct = comp.get('n', 0.0) / 10.0
-                    p2o5_pct = comp.get('p', 0.0) / (10.0 * CONV['P2O5_P']) if CONV['P2O5_P'] else 0.0
-                    k2o_pct = comp.get('k', 0.0) / (10.0 * CONV['K2O_K']) if CONV['K2O_K'] else 0.0
-                    cao_pct = comp.get('ca', 0.0) / (10.0 * CONV['CaO_Ca']) if CONV['CaO_Ca'] else 0.0
-                    mgo_pct = comp.get('mg', 0.0) / (10.0 * CONV['MgO_Mg']) if CONV['MgO_Mg'] else 0.0
-                    so3_pct = comp.get('s', 0.0) / (10.0 * CONV['SO3_S']) if CONV['SO3_S'] else 0.0
-
-                    ename = st.text_input("Name des Düngers", value=f['name'], key=f"ename_{f['name']}")
-                    eprice = st.number_input("Preis pro ml (€)", format="%.4f", value=f.get('price_per_ml', 0.0), key=f"eprice_{f['name']}")
-                    st.write("Inhaltsstoffe (in % oder mg/ml eingeben)")
-                    c1, c2, c3 = st.columns(3)
-                    en = c1.number_input("N (Gesamtstickstoff, %)", value=round(n_pct, 3), key=f"en_{f['name']}")
-                    ep2 = c2.number_input("P2O5 (%,)", value=round(p2o5_pct, 3), key=f"ep2_{f['name']}")
-                    ek2 = c3.number_input("K2O (%,)", value=round(k2o_pct, 3), key=f"ek2_{f['name']}")
-                    ecao = c1.number_input("CaO (% )", value=round(cao_pct, 3), key=f"ecao_{f['name']}")
-                    emgo = c2.number_input("MgO (% )", value=round(mgo_pct, 3), key=f"emgo_{f['name']}")
-                    eso3 = c3.number_input("SO3 (% )", value=round(so3_pct, 3), key=f"eso3_{f['name']}")
-                    if st.form_submit_button("Speichern", key=f"save_fert_{f['name']}"):
-                        # Convert back to elemental mg/ml (same convention as creation)
-                        new_comp = {
-                            "n": en * 10,
-                            "p": ep2 * 10 * CONV["P2O5_P"],
-                            "k": ek2 * 10 * CONV["K2O_K"],
-                            "ca": ecao * 10 * CONV["CaO_Ca"],
-                            "mg": emgo * 10 * CONV["MgO_Mg"],
-                            "s": eso3 * 10 * CONV["SO3_S"]
-                        }
-                        ferts_table.update({'name': ename, 'price_per_ml': eprice, 'composition': new_comp}, Query().name == f['name'])
-                        st.success("Dünger aktualisiert")
-                        st.session_state.pop(f"edit_fert_{f['name']}", None)
-                        st.rerun()
+        
+        st.success("✅ Dünger gespeichert!")
+        st.rerun()
 
 # --- TAB 3: PFLANZEN ---
 with tab3:
     st.header("Pflanzen & Wachstumsphasen")
     
-    with st.form("plant_form"):
-        p_name = st.text_input("Name der Pflanze (z.B. Tomate)")
-        st.write("Zielwerte für die Phase (mg/L)")
-        phase_name = st.text_input("Name der Phase (z.B. Bloom)")
-        
-        c1, c2, c3 = st.columns(3)
-        tn = c1.number_input("Ziel N")
-        tp = c2.number_input("Ziel P")
-        tk = c3.number_input("Ziel K")
-        tca = c1.number_input("Ziel Ca")
-        tmg = c2.number_input("Ziel Mg")
-        ts = c3.number_input("Ziel S")
-        
-        if st.form_submit_button("Pflanze/Phase speichern"):
-            existing = plants_table.search(Query().name == p_name)
-            if existing:
-                phases = existing[0]['phases']
-                phases[phase_name] = {"n": tn, "p": tp, "k": tk, "ca": tca, "mg": tmg, "s": ts}
-                plants_table.update({'phases': phases}, Query().name == p_name)
-            else:
-                plants_table.insert({
-                    "name": p_name,
-                    "phases": {phase_name: {"n": tn, "p": tp, "k": tk, "ca": tca, "mg": tmg, "s": ts}}
-                })
-            st.success("Gespeichert!")
-            st.rerun()
-
-    # Liste der Pflanzen (mit Editiermöglichkeit)
+    # Build table data from database
+    table_data = []
     for p in plants_table.all():
-        st.write(f"### {p['name']}")
-        # Zeige Phase/Nährstoffprofile als Tabelle
         phases = p.get('phases', {})
-        if phases:
-            df_phases = pd.DataFrame(phases).T
-            st.table(df_phases)
-        else:
-            st.write("(keine Phasen)")
-        colp1, colp2 = st.columns([4, 1])
-        if colp2.button(f"{p['name']} löschen", key=f"delplant_{p['name']}"):
-            plants_table.remove(Query().name == p['name'])
-            st.rerun()
+        for phase_name, nutrient_vals in phases.items():
+            table_data.append({
+                "Pflanze": p['name'],
+                "Phase": phase_name,
+                "N (mg/L)": nutrient_vals.get('n', 0.0),
+                "P (mg/L)": nutrient_vals.get('p', 0.0),
+                "K (mg/L)": nutrient_vals.get('k', 0.0),
+                "Ca (mg/L)": nutrient_vals.get('ca', 0.0),
+                "Mg (mg/L)": nutrient_vals.get('mg', 0.0),
+                "S (mg/L)": nutrient_vals.get('s', 0.0)
+            })
+    
+    # Create editable dataframe
+    df = pd.DataFrame(table_data)
+    
+    st.subheader("Pflanzen & Phasen bearbeiten")
+    st.info("Bearbeite die Tabelle direkt. Neue Zeilen werden automatisch hinzugefügt.")
+    
+    edited_df = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="plants_editor"
+    )
+    
+    # Save changes back to database
+    if st.button("💾 Änderungen speichern", type="primary", key="save_plants_btn"):
+        # Clear old data
+        plants_table.truncate()
+        
+        # Rebuild from edited dataframe
+        plants_dict = {}
+        for _, row in edited_df.iterrows():
+            plant_name = row['Pflanze']
+            phase_name = row['Phase']
+            
+            if plant_name and phase_name:  # Skip empty rows
+                if plant_name not in plants_dict:
+                    plants_dict[plant_name] = {"name": plant_name, "phases": {}}
+                
+                plants_dict[plant_name]["phases"][phase_name] = {
+                    "n": float(row['N (mg/L)']) if pd.notna(row['N (mg/L)']) else 0.0,
+                    "p": float(row['P (mg/L)']) if pd.notna(row['P (mg/L)']) else 0.0,
+                    "k": float(row['K (mg/L)']) if pd.notna(row['K (mg/L)']) else 0.0,
+                    "ca": float(row['Ca (mg/L)']) if pd.notna(row['Ca (mg/L)']) else 0.0,
+                    "mg": float(row['Mg (mg/L)']) if pd.notna(row['Mg (mg/L)']) else 0.0,
+                    "s": float(row['S (mg/L)']) if pd.notna(row['S (mg/L)']) else 0.0
+                }
+        
+        # Insert back to database
+        for plant in plants_dict.values():
+            plants_table.insert(plant)
+        
+        st.success("✅ Pflanzendaten gespeichert!")
+        st.rerun()
 
-        if st.button(f"Bearbeiten {p['name']}", key=f"edit_plant_btn_{p['name']}"):
-            st.session_state[f"edit_plant_{p['name']}"] = True
-
-        if st.session_state.get(f"edit_plant_{p['name']}", False):
-            with st.expander(f"Bearbeite {p['name']}", expanded=True):
-                with st.form(f"plant_edit_form_{p['name']}"):
-                    new_name = st.text_input("Pflanzenname", value=p['name'], key=f"pname_{p['name']}")
-                    phases = p.get('phases', {})
-                    phase_options = list(phases.keys())
-                    sel = st.selectbox("Phase wählen zum Bearbeiten", options=(phase_options + ["--Neu--"]) if phase_options else ["--Neu--"], key=f"phase_sel_{p['name']}")
-                    phase_name = st.text_input("Phasenname", value=(sel if sel != "--Neu--" else ""), key=f"phase_name_{p['name']}")
-                    c1, c2, c3 = st.columns(3)
-                    cur = phases.get(sel, {}) if sel != "--Neu--" else {}
-                    tn = c1.number_input("Ziel N", value=cur.get('n', 0.0), key=f"tn_{p['name']}")
-                    tp = c2.number_input("Ziel P", value=cur.get('p', 0.0), key=f"tp_{p['name']}")
-                    tk = c3.number_input("Ziel K", value=cur.get('k', 0.0), key=f"tk_{p['name']}")
-                    tca = c1.number_input("Ziel Ca", value=cur.get('ca', 0.0), key=f"tca_{p['name']}")
-                    tmg = c2.number_input("Ziel Mg", value=cur.get('mg', 0.0), key=f"tmg_{p['name']}")
-                    ts = c3.number_input("Ziel S", value=cur.get('s', 0.0), key=f"ts_{p['name']}")
-                    if st.form_submit_button("Speichern", key=f"save_plant_{p['name']}"):
-                        updated_phases = dict(phases)
-                        if phase_name:
-                            updated_phases[phase_name] = {"n": tn, "p": tp, "k": tk, "ca": tca, "mg": tmg, "s": ts}
-                        plants_table.update({'name': new_name, 'phases': updated_phases}, Query().name == p['name'])
-                        st.success("Pflanze/Phase gespeichert")
-                        st.session_state.pop(f"edit_plant_{p['name']}", None)
-                        st.rerun()
+# --- TAB 4: LOGS ---
+with tab4:
+    st.header("Mischungs-Logs")
+    
+    all_logs = logs_table.all()
+    
+    if not all_logs:
+        st.info("Keine Logs vorhanden. Erstelle eine Mischung und logge sie!")
+    else:
+        # Display logs in reverse order (newest first)
+        for log in reversed(all_logs):
+            with st.expander(f"📅 {log['timestamp']} - {log['plant']} ({log['phase']})"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Pflanze:** {log['plant']}")
+                    st.write(f"**Phase:** {log['phase']}")
+                    st.write(f"**Wasser:** {log['water_type']}")
+                    st.write(f"**Menge:** {log['liters']} L")
+                
+                with col2:
+                    st.write(f"**Datum/Zeit:** {log['timestamp']}")
+                    st.write(f"**Kosten:** {log['total_cost']} €")
+                
+                st.write("**Düngemittel:**")
+                fert_log_df = pd.DataFrame(log['fertilizers'])
+                st.table(fert_log_df)
